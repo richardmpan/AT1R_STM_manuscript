@@ -1,0 +1,2549 @@
+library(tidyverse)
+library(DESeq2)
+library(AnnotationDbi)
+library(ggplot2)
+library(ggrepel)
+library(AnnotationDbi)
+library(org.Hs.eg.db)
+library(TCGAbiolinks)
+library(Seurat)
+library(GenomicFeatures)
+library(ggnewscale)
+
+# Import CVD data -----
+CVD.1 <- read.csv("CVD_RPKM_1.csv")
+CVD.1 <- distinct(CVD.1, gene_name, .keep_all = TRUE)
+CVD.2 <- read.csv("CVD_RPKM_2.csv")
+CVD.2 <- distinct(CVD.2, gene_name, .keep_all = TRUE)
+CVD.RPKM <- inner_join(CVD.1, CVD.2, by = "gene_name")
+CVD.RPKM$gene_id = mapIds(org.Hs.eg.db,
+                          keys = CVD.RPKM$gene_name,
+                          keytype = "SYMBOL",
+                          column = "ENSEMBL",
+                          multiVals="first")
+CVD.RPKM <- as.data.frame(na.omit(CVD.RPKM))
+CVD.RPKM <- distinct(CVD.RPKM, gene_id, .keep_all = TRUE)
+rownames(CVD.RPKM) <- CVD.RPKM$gene_id
+CVD.RPKM <- CVD.RPKM[,c(1:80, 82:177)]
+
+CVD <- CreateSeuratObject(CVD.RPKM, project = "Pseudo-scRNA")
+CVD[["source"]] <- "CVD"
+
+# Prepare AML data ------
+BEATAML.raw <- read.delim("BEATAML_wave1-4_raw_counts.txt", row.names = "stable_id")
+BEATAML <- BEATAML.raw[intersect(rownames(BEATAML.raw), names(ebg)),]
+BEATAML.deseq <- DESeqDataSetFromMatrix(countData = BEATAML,
+                                        colData = data.frame(
+                                          sample = colnames(BEATAML),
+                                          condition = colnames(BEATAML),
+                                          row.names = "sample"
+                                        ),
+                                        design = ~ condition)
+txdb <- makeTxDbFromGFF("GRCh38.gtf", format="gtf", circ_seqs=character())
+ebg <- exonsBy(txdb, by="gene")
+ebg <- ebg[intersect(rownames(BEATAML.raw), names(ebg))]
+rowRanges(BEATAML.deseq) = GRangesList(ebg)
+BEATAML.fpkm = fpkm(BEATAML.deseq)
+BEATAML.fpkm <- data.frame(BEATAML.fpkm)
+BEATAML.fpkm$gene_id <- rownames(BEATAML.fpkm)
+
+TARGET.raw <- data.frame(readRDS("TARGET.raw.rds"))
+txdb <- makeTxDbFromGFF("GRCh38.gtf", format="gtf", circ_seqs=character())
+ebg <- exonsBy(txdb, by="gene")
+ebg <- ebg[intersect(rownames(TARGET.raw), names(ebg))]
+TARGET <- TARGET.raw[intersect(rownames(TARGET.raw), names(ebg)),]
+TARGET.deseq <- DESeqDataSetFromMatrix(countData = TARGET,
+                                       colData = data.frame(
+                                         sample = colnames(TARGET),
+                                         condition = colnames(TARGET),
+                                         row.names = "sample"
+                                       ),
+                                       design = ~ condition)
+rowRanges(TARGET.deseq) = GRangesList(ebg)
+TARGET.fpkm = fpkm(TARGET.deseq)
+TARGET.fpkm <- data.frame(TARGET.fpkm)
+TARGET.fpkm$gene_id <- rownames(TARGET.fpkm)
+
+
+TCGA.raw <- data.frame(readRDS("TCGA.raw.rds"))
+txdb <- makeTxDbFromGFF("GRCh38.gtf", format="gtf", circ_seqs=character())
+ebg <- exonsBy(txdb, by="gene")
+ebg <- ebg[intersect(rownames(TCGA.raw), names(ebg))]
+TCGA <- TCGA.raw[intersect(rownames(TCGA.raw), names(ebg)),]
+TCGA.deseq <- DESeqDataSetFromMatrix(countData = TCGA,
+                                     colData = data.frame(
+                                       sample = colnames(TCGA),
+                                       condition = colnames(TCGA),
+                                       row.names = "sample"
+                                     ),
+                                     design = ~ condition)
+rowRanges(TCGA.deseq) = GRangesList(ebg)
+TCGA.fpkm = fpkm(TCGA.deseq)
+TCGA.fpkm <- data.frame(TCGA.fpkm)
+TCGA.fpkm$gene_id <- rownames(TCGA.fpkm)
+
+AML.fpkm <- inner_join(BEATAML.fpkm, TARGET.fpkm, by = "gene_id")
+AML.fpkm <- inner_join(AML.fpkm, TCGA.fpkm, by = "gene_id")
+AML.fpkm <- column_to_rownames(AML.fpkm, var = "gene_id")
+AML.fpkm <- as.data.frame(na.omit(AML.fpkm))
+AML <- CreateSeuratObject(AML.fpkm, project = "Pseudo-scRNA")
+AML[["source"]] <- "AML"
+
+# Integrate CVD and AML -----
+m.int <- list(AML = AML, CVD = CVD)
+features <- SelectIntegrationFeatures(object.list = m.int)
+anchors <- FindIntegrationAnchors(object.list = m.int, anchor.features = features)
+anchors@anchor.features <- append(anchors@anchor.features)
+m.com <- IntegrateData(anchorset = anchors)
+
+DefaultAssay(m.com) <- "integrated"
+
+m.com <- ScaleData(m.com, features = all.genes)
+m.com <- RunPCA(m.com, features = VariableFeatures(object = m.com))
+DimHeatmap(m.com, dims = 1:5, cells = 500, balanced = TRUE)
+m.com <- FindNeighbors(m.com, dims = 1:10)
+m.com <- FindClusters(m.com, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8))
+m.com <- RunUMAP(m.com, dims = 1:10)
+m.com <- RunTSNE(m.com, dims = 1:10)
+
+DefaultAssay(m.com) <- "RNA"
+
+m.com <- ScaleData(m.com, features = all.genes)
+m.com <- FindVariableFeatures(m.com)
+m.com <- RunPCA(m.com, features = VariableFeatures(object = m.com))
+DimHeatmap(m.com, dims = 1:5, cells = 500, balanced = TRUE)
+m.com <- FindNeighbors(m.com, dims = 1:10)
+m.com <- FindClusters(m.com, resolution = c(0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.8))
+m.com <- RunUMAP(m.com, dims = 1:10)
+m.com <- RunTSNE(m.com, dims = 1:10)
+saveRDS(m.com, "m.com.rds")
+
+# identifying core bond, DEG of each cluster against non ------
+library(gdata)
+library(httr)
+library(jsonlite)
+a <- c(0,4,5,6,7,8,10)
+b <- paste("marker.", c(0,4,5,6,7,8,10), sep = "")
+c <- paste("marker.", c("0.sig","4.sig","5.sig","6.sig","7.sig","8.sig","10.sig"), sep = "")
+marker.all <- data.frame()
+marker.all.sig <- data.frame()
+for (X in 1:7){
+  tmp <- FindMarkers(m.com, ident.1 = a[X], ident.2 = c(1,2,3,9,11))
+  tmp <- rownames_to_column(tmp, "gene_id")
+  tmp$symbol = mapIds(org.Hs.eg.db,
+                      keys=tmp$gene_id,
+                      column="SYMBOL",
+                      keytype="ENSEMBL",
+                      multiVals="first")
+  tmp.sig <- filter(tmp, abs(avg_log2FC) > 2 & p_val_adj < 0.05)%>%
+    filter_(pct.1 > 0.7 | pct.2 > 0.7) %>%
+    na.omit()
+  marker.all <- rbind(marker.all, tmp)
+  marker.all.sig <- rbind(marker.all.sig, tmp.sig)
+}
+
+CVD.genes <- read.csv('CVD.gene.csv')
+AML.genes <- read.csv('AML.gene.csv')
+c.bond <- Reduce(intersect, list(marker.6$symbol, marker.7$symbol, marker.8$symbol, AML.genes, CVD.genes))
+
+
+# Figure 1 A, B, C Clusters -----
+m.com <- readRDS("m.com.rds")
+DimPlot(m.com, reduction = "umap", 
+        group.by = "source", 
+        cols = c("#da2c22", "#070606"))+
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.text = element_blank())+
+  labs(title = NULL)
+ggsave("Figure 1.A cluster by source.jpeg", dpi = 300, width = 4.5, height = 4, units = "in")
+
+DimPlot(m.com, reduction = "umap", label = TRUE, label.size = 10) +
+  theme(axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20))
+ggsave("Figure 1.B clusters.jpeg", dpi = 300, width = 4.8, height = 4, units = "in")
+
+pie.chart <- data.frame()
+for (X in 0:11){
+  tmp1 <- filter(m.com@meta.data, source == "AML" & integrated_snn_res.0.8 == X)
+  tmp2 <- filter(m.com@meta.data, source == "CVD" & integrated_snn_res.0.8 == X)
+  pie.chart <- rbind(pie.chart, data.frame(number = c(length(rownames(tmp1)), 
+                                                      length(rownames(tmp2))),
+                                           source = c("AML", "CVD"),
+                                           cluster = c(X, X)
+  )
+  )
+}
+tmp <- c()
+for (X in seq(1, 24, 2)){
+  tmp <- append(tmp, pie.chart$number[X]/(pie.chart$number[X] + pie.chart$number[X+1]))
+  tmp <- append(tmp, pie.chart$number[X+1]/(pie.chart$number[X+1] + pie.chart$number[X]))
+}
+pie.chart$percent = tmp
+ggplot(data = pie.chart, aes(x = "", y = percent, fill = source, group = source)) +
+  geom_bar(stat = "identity", width = 1) +
+  coord_polar("y", start = 1, direction = 1) +
+  facet_grid(. ~ cluster) +
+  scale_fill_manual(values = c("#da2c22", "#070606")) +
+  theme_void() +
+  theme(legend.position = "bottom",
+        legend.justification = "top",
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        strip.text = element_blank()
+  ) +
+  guides(fill = guide_legend(override.aes = list(shape = 25)))
+ggsave("Figure 1.C piechart.jpeg", width = 12, height = 2, units = "in", dpi = 300)
+
+
+# Figure 1.D heatmap showing AT1R -----
+tmp = mapIds(org.Hs.eg.db,
+             keys=c.bond,
+             column="ENSEMBL",
+             keytype="SYMBOL",
+             multiVals="first")
+p <- DoHeatmap(m.com, features = Reduce(intersect, 
+                                        list(marker.6$gene_id, marker.7$gene_id, marker.8$gene_id, tmp)),
+               label = FALSE) & NoLegend()
+p2 <- p + theme(axis.text.y = element_blank()) +
+  guides(color = "none")
+
+ggsave("Figure 1.D heatmap.jpeg", plot = p2, dpi = 300, width = 4, height = 4, units = "in")
+
+
+# Figure 1.E Venn diagram ------
+## making plots -----
+library(ggVennDiagram)
+
+venn <- list(
+  AML = AML.genes,
+  CVD = CVD.genes,
+  "cluster 6 DEG" = marker.6$symbol, "cluster 7 DEG" = marker.7$symbol, "cluster 8 DEG" = marker.8$symbol
+)
+ggVennDiagram(venn, label = "none", set_color = pal_jco()(5)) +
+  scale_fill_gradient(low = "white", high = "white")+
+  theme(legend.position = "none",
+        text = element_blank(),
+        axis.text = element_blank())
+
+ggsave("Figure 1.E Venn.jpeg", dpi = 300, width = 8, height = 8, units = "in")
+
+# Figure 1.F AT1R BEATAML -------
+BEAT.norm <- readRDS("BEAT.norm.AT1R.rds")
+AML.fpkm <- readRDS("AML.fpkm.rds")
+AML.fpkm <- column_to_rownames(AML.fpkm, var = "gene_id")
+norm.fpkm <- AML.fpkm["ENSG00000144891", rownames(BEAT.norm)[c(1:5, 7:16)]]
+BEAT.AT1R.norm.AML <- rbind(data.frame(condition = "Normal",
+                                       value = unlist(norm.fpkm[])),
+                            data.frame(condition = "AML",
+                                       value = unlist(AML.fpkm["ENSG00000144891", !colnames(AML.fpkm) %in% rownames(BEAT.norm)[c(1:5, 7:16)]]))
+)
+ggplot(data = BEAT.AT1R.norm.AML, aes(x = condition, y= value))+
+  geom_point(position = position_jitter()) +
+  geom_line(data=data.frame(x=c(1,2), y=c(17.5,17.5)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(18,18)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10) +
+  scale_y_continuous(limits = c(0,18)) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.9))
+
+rm(AML.fpkm)
+
+ggsave("Figure 1.F BEATAML.AT1R.exp.jpeg", dpi = 300, width = 2, height = 4, units = "in")
+
+# Figure 1.H AT1R flow -------
+flow.AT1R <- read.csv("AT1R flow MFI.csv")
+flow.AT1R.m.sd <- flow.AT1R %>% group_by(condition) %>%
+  mutate(mean = mean(value), sd = sd (value))
+ggplot(data = flow.AT1R.m.sd, aes(x = condition, y = mean, fill = factor(condition)))+
+  geom_errorbar(aes(ymin = 100, ymax = mean+sd, color = factor(condition)),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#da2c22", "#070606")) +
+  geom_bar(stat = "identity", position = position_dodge())+
+  new_scale_color()+
+  geom_point(data = flow.AT1R, aes(x = condition, y = value, color = factor(condition)),
+             position = position_jitterdodge()) +
+  scale_fill_manual(values = c("#da2c22", "#070606")) +
+  scale_color_manual(values = c("#070606", "#da2c22")) +
+  scale_y_continuous(limits = c(0,30000))+
+  geom_line(data=data.frame(x=c(1,2), y=c(29000,29000)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(30000,30000)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.ticks.x = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.7))
+
+ggsave("Figure 1.J AT1R_flow.jpeg", dpi = 300, width = 1.5, height = 4, units = "in")
+
+flow.AT1R.sharp <- flow.AT1R %>%
+  group_by(condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+
+broom::tidy(t.test(filter(flow.AT1R, condition == "normal")$value, 
+                   filter(flow.AT1R, condition == "AML")$value))
+
+library(tidyverse)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+library(ggnewscale)
+
+# Figure 2 B Cell line AT1R expression -------
+B <- read.csv("2B.csv")
+B <- gather(B)
+B.sem <- data_summary(B, "value", groupnames = "key")
+B.sem <- B.sem[order(B.sem$value, decreasing = TRUE),]
+B.sem$key <- factor(B.sem$key, levels = c("THP1", "MV4.11", "NB4", "Kasumi1", "MOLM"))
+B$key <- factor(B$key, levels = c("THP1", "MV4.11", "NB4", "Kasumi1", "MOLM"))
+ggplot(B.sem, aes(key, value, fill = key)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = key),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = B, aes(key, value), 
+             position = position_jitterdodge()) +
+  scale_fill_manual(values =  c("#91268f", "#2e3092", "#f7921d", "#ee3223", "black")) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.2))
+
+ggsave("Fig. 2B AT1R exp cell line.jpeg", width = 2.5, height = 4, dpi = 300)
+
+# Figure 2C AT1R exp shRNA -------
+C2 <- read.csv("2C.csv")
+C2$key <- factor(C2$key, levels = c("Scramble", "367", "389", "474"))
+ggplot(C2, aes(key, value, fill = key))+
+  geom_bar(stat = "identity") +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        axis.ticks.y = element_line(lineend = "square"),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0,0), limit = c(0,100000))
+
+ggsave("Fig. 2C AT1R exp shRNA.jpeg", width = 2, height = 4, dpi = 300)
+
+# Figure 2 D shRNA proliferation ---------
+D2 <- read.csv("2D.csv")
+D2.sem <- data_summary(D2, "value", groupnames = c("time", "condition"))
+D2.sem$sd <- ifelse(D2.sem$time %in% c("Day 0", "Day 2"), NA, as.numeric(D2.sem$sd))
+D2.sem$sd <- D2.sem$sd/10
+D2.sem$condition <- factor(D2.sem$condition, levels = c("scramble", "369", "389", "474"))
+D2$condition <- factor(D2$condition, levels = c("scramble", "369", "389", "474"))
+ggplot(D2.sem, aes(time, value, fill = condition, color = condition, group = condition)) +
+  geom_errorbar(aes(ymin = value-sd, ymax = value+sd, color = condition),
+                width=0.15, linewidth = 1) +
+  geom_line(linewidth = 2) +
+  geom_point(aes(shape = condition), size = 4) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        legend.position = c(.1,.8)) +
+  scale_y_continuous(expand = c(0, 0.5))
+
+ggsave("Fig. 2D AT1R shRNA proliferation.jpeg", width = 4, height = 4, dpi = 300)
+
+# Figure 2E shRNA proliferation cell lines -------
+E2 <- read.csv("2E.csv")
+E2 <- gather(E2, "cell", "value", -condition)
+E2.sem <- data_summary(E2, "value", groupnames = c("condition", "cell"))
+E2.sem <- E2.sem[order(E2.sem$value, decreasing = TRUE),]
+E2.sem$condition <- factor(E2.sem$condition, levels = c("scramble", "367", "389", "474"))
+E2$condition <- factor(E2$condition, levels = c("scramble", "367", "389", "474"))
+ggplot(E2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = E2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~cell, switch = "x") +
+  geom_text(data=data.frame(x=1.2, y=560000), aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,580000)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(-.5, "lines"),
+        text = element_text(family = 'Arial', size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.2,.8),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 2E shRNA cell lines.jpeg", width = 3.5, height = 4, dpi = 300)
+
+
+# Figure 2G CFU -------
+G2 <- read.csv("2G.csv")
+G2 <- gather(G2, "key", "value", -condition)
+G2.sem <- data_summary(G2, "value", groupnames = c("key", "condition"))
+G2.sem <- G2.sem[order(G2.sem$value, decreasing = TRUE),]
+G2.sem$condition <- factor(G2.sem$condition, levels = c("Scramble"))
+G2$condition <- factor(G2$condition, levels = c("Scramble"))
+
+G2.sharp <- G2 %>%
+  group_by(key, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+G2.t <- filter(G2, condition == "Scramble")
+G2.t$value2 <- filter(G2, condition == "474")$value
+G2.t <- G2.t %>%
+  group_by(key) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+
+ggplot(G2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = G2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,500)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(450,450)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),7), y=rep(c(460,460),7), 
+                            label = ifelse(G2.t$p.value < 0.001, rep("***",2), rep("**", 2))),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(-.5, "lines"),
+        text = element_text(family = 'Arial', size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.6,.6),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 2G hAML shRNA CFU.jpeg", width = 3.5, height = 4, dpi = 300)
+
+
+# Figure 2 H. shRNA survival -------
+library(survminer)
+require(survival)
+H2 <- read.csv("2H.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = H2)
+p <- ggsurvplot(fit, data = H2, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("474", "Sramble"),
+                legend = c(.1, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 2H.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+# Figure 2I Leukemic burden -------
+I2 <- read.csv("2I.csv")
+I2 <- gather(I2, "key", "value", -condition)
+I2.sem <- data_summary(I2, "value", groupnames = c("key", "condition"))
+I2.sem$condition <- factor(I2.sem$condition, levels = c("Scramble", "474"))
+I2.sem$key <- factor(I2.sem$key, levels = c("BM", "SP", "LV", "PB"))
+I2$condition <- factor(I2$condition, levels = c("Scramble", "474"))
+I2$key <- factor(I2$key, levels = c("BM", "SP", "LV", "PB"))
+
+I2.sharp <- I2 %>%
+  group_by(key, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+I2.t <- filter(I2, condition == "Scramble")
+I2.t$value2 <- filter(I2, condition == "474")$value
+I2.t <- I2.t %>%
+  group_by(key) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+ggplot(I2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = I2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,100)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(90,90)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),4), y=rep(c(92,92),4), 
+                            label = ifelse(I2.t$p.value < 0.001, rep("***",2), 
+                                           ifelse(I2.t$p.value < 0.01, rep("**",2),
+                                                  rep("*",2)))),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.5,.7),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 2I hAML shRNA leukemic burden.jpeg", width = 4, height = 4, dpi = 300)
+
+# Figure 2J SP wt -------
+J2 <- read.csv("2J SP wt.csv")
+J2.sem <- data_summary(J2, "value", groupnames = c("condition"))
+J2.sem$condition <- factor(J2.sem$condition, levels = c("Scramble", "474"))
+J2$condition <- factor(J2$condition, levels = c("Scramble", "474"))
+ggplot(J2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = J2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,300)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(280,280)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(285,285)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.7))
+
+
+ggsave("Fig. 2J hAML shRNA SP wt.jpeg", width = 2, height = 4, dpi = 300)
+
+# Figure 2 L shRNA survival 2 -------
+library(survminer)
+require(survival)
+L2 <- read.csv("2L.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = L2)
+p <- ggsurvplot(fit, data = L2, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("474", "Sramble"),
+                legend = c(.1, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 2L.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+# Figure 2M Leukemic burden 2 -------
+M2 <- read.csv("2M.csv")
+M2 <- gather(M2, "key", "value", -condition)
+M2.sem <- data_summary(M2, "value", groupnames = c("key", "condition"))
+M2.sem$condition <- factor(M2.sem$condition, levels = c("Scramble", "474"))
+M2.sem$key <- factor(M2.sem$key, levels = c("BM", "SP", "LV", "PB"))
+M2$condition <- factor(M2$condition, levels = c("Scramble", "474"))
+M2$key <- factor(M2$key, levels = c("BM", "SP", "LV", "PB"))
+
+M2.sharp <- M2 %>%
+  group_by(key, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+M2.t <- filter(M2, condition == "Scramble")
+M2.t$value2 <- filter(M2, condition == "474")$value
+M2.t <- M2.t %>%
+  group_by(key) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+ggplot(M2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = M2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,100)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(90,90)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),4), y=rep(c(92,92),4), 
+                            label = ifelse(M2.t$p.value < 0.001, rep("***",2), 
+                                           ifelse(M2.t$p.value < 0.01, rep("**",2),
+                                                  rep("*",2)))),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.5,.7),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 2M hAML shRNA leukemic burden 2.jpeg", width = 4, height = 4, dpi = 300)
+
+
+# Figure 2N SP wt -------
+N2 <- read.csv("2N SP wt.csv")
+N2.sem <- data_summary(N2, "value", groupnames = c("condition"))
+N2.sem$condition <- factor(N2.sem$condition, levels = c("Scramble", "474"))
+N2$condition <- factor(N2$condition, levels = c("Scramble", "474"))
+ggplot(N2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = N2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,300)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(280,280)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(285,285)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.7))
+
+
+ggsave("Fig. 2N hAML shRNA SP wt.jpeg", width = 2, height = 4, dpi = 300)
+
+
+
+# Figure 2 O. shRNA survival -------
+library(survminer)
+require(survival)
+O2 <- read.csv("2O.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = O2)
+p <- ggsurvplot(fit, data = O2, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("474", "Sramble"),
+                legend = c(.1, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 2O.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+# Figure 2P Leukemic burden 2 -------
+P2 <- read.csv("2P.csv")
+P2 <- gather(P2, "key", "value", -condition)
+P2.sem <- data_summary(P2, "value", groupnames = c("key", "condition"))
+P2.sem$condition <- factor(P2.sem$condition, levels = c("Scramble", "474"))
+P2.sem$key <- factor(P2.sem$key, levels = c("BM", "SP", "LV", "PB"))
+P2$condition <- factor(P2$condition, levels = c("Scramble", "474"))
+P2$key <- factor(P2$key, levels = c("BM", "SP", "LV", "PB"))
+
+P2.sharp <- P2 %>%
+  group_by(key, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+P2.t <- filter(P2, condition == "Scramble")
+P2.t$value2 <- filter(P2, condition == "474")$value
+P2.t <- P2.t %>%
+  group_by(key) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+ggplot(P2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = P2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,100)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(93,93)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),4), y=rep(c(95,95),4), 
+                            label = ifelse(P2.t$p.value < 0.001, rep("***",2), 
+                                           ifelse(P2.t$p.value < 0.01, rep("**",2),
+                                                  rep("*",2)))),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.5,.8),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 2P hAML shRNA leukemic burden 2.jpeg", width = 4, height = 4, dpi = 300)
+
+
+# Figure 2Q SP wt -------
+Q2 <- read.csv("2Q SP wt.csv")
+Q2.sem <- data_summary(Q2, "value", groupnames = c("condition"))
+Q2.sem$condition <- factor(Q2.sem$condition, levels = c("Scramble", "474"))
+Q2$condition <- factor(Q2$condition, levels = c("Scramble", "474"))
+ggplot(Q2.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = Q2, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,300)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(280,280)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(285,285)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.7))
+
+
+ggsave("Fig. 2Q hAML shRNA SP wt.jpeg", width = 2, height = 4, dpi = 300)
+
+# combined sp wt ---
+sp.wt.com <- J2 %>%
+  mutate(sample='sample #1') %>%
+  rbind(N2 %>%
+          mutate(sample='sample #2')) %>%
+  rbind(Q2 %>%
+          mutate(sample='sample #3')) %>%
+  group_by(condition, sample) %>%
+  mutate(mean=mean(value), sd=sd(value))
+
+ggplot(sp.wt.com, aes(condition, mean, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = mean+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = sp.wt.com, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,300)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(280,280)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=c(1.5,1.5), y=c(285,285)),
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 8) +
+  facet_wrap(.~sample, strip.position = "bottom")+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.2,.8),
+        strip.background = element_blank(),
+        strip.text = element_blank(),
+        strip.placement = 'outside')
+
+ggsave("Fig. 2 hAML shRNA SP wt combined.jpeg", width = 4, height = 4, dpi = 300)
+
+library(tidyverse)
+library(ggplot2)
+library(ggnewscale)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+
+# Figure 3B -------
+B3 <- read.csv("3B.csv")
+B3 <- gather(B3, "cell", "value", -condition)
+B3.sem <- data_summary(B3, "value", groupnames = c("condition", "cell"))
+B3.sem$condition <- factor(B3.sem$condition, levels = c("WT", "KO"))
+B3.sem$cell <- factor(B3.sem$cell, levels = c("LT.HSC", "ST.HSC", "MPP"))
+B3$condition <- factor(B3$condition, levels = c("WT", "KO"))
+B3$cell <- factor(B3$cell, levels = c("LT.HSC", "ST.HSC", "MPP"))
+
+B3.sharp <- B3 %>%
+  group_by(cell, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+B3.t <- filter(B3, condition == "WT")
+B3.t$value2 <- filter(B3, condition == "KO")$value
+B3.t <- B3.t %>%
+  group_by(cell) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+ggplot(B3.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = B3, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~cell, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,2))+
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_color_manual(values = c("#C77CFF", "#F8766D")) +
+  geom_line(data=data.frame(x=c(1,2), y=c(1.75,1.75)),
+            aes(x,y),
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),3),
+                            y=rep(c(1.85,1.85),3)
+  ), label = "NS",
+  aes(x,y, label = label),
+  inherit.aes = FALSE,
+  size = 5
+  )+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.1,.7),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 3B.jpeg", width = 4, height = 4, units = "in", dpi = 300)
+
+# Figure 3 C -------------
+C3 <- read.csv("3C.csv")
+C3 <- gather(C3, "cell", "value", -condition)
+C3.sem <- data_summary(C3, "value", groupnames = c("condition", "cell"))
+C3.sem$condition <- factor(C3.sem$condition, levels = c("WT", "KO"))
+C3.sem$cell <- factor(C3.sem$cell, levels = c("GMP", "CMP", "CLP"))
+C3$condition <- factor(C3$condition, levels = c("WT", "KO"))
+C3$cell <- factor(C3$cell, levels = c("GMP", "CMP", "CLP"))
+ggplot(C3.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = C3, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~cell, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,9))+
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_color_manual(values = c("#C77CFF", "#F8766D")) +
+  geom_line(data=data.frame(x=c(1,2), y=c(8,8)),
+            aes(x,y),
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),3),
+                            y=rep(c(8.5,8.5),3)
+  ), label = "NS",
+  aes(x,y, label = label),
+  inherit.aes = FALSE,
+  size = 5
+  )+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.4,.6),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 3C.jpeg", width = 4, height = 4, units = "in", dpi = 300)
+
+# Figure 3 E -------------
+E3 <- read.csv("3E.csv")
+E3 <- gather(E3, "cell", "value", -condition)
+E3.sem <- data_summary(E3, "value", groupnames = c("condition", "cell"))
+E3.sem$condition <- factor(E3.sem$condition, levels = c("WT", "KO"))
+E3.sem$cell <- factor(E3.sem$cell, levels = c("G0", "G1", "S.G2.M"))
+E3$condition <- factor(E3$condition, levels = c("WT", "KO"))
+E3$cell <- factor(E3$cell, levels = c("G0", "G1", "S.G2.M"))
+ggplot(E3.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = E3, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~cell, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,79))+
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_color_manual(values = c("#C77CFF", "#F8766D")) +
+  geom_line(data=data.frame(x=c(1,2), y=c(70,70)),
+            aes(x,y),
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),3),
+                            y=rep(c(75,75),3)
+  ), label = "NS",
+  aes(x,y, label = label),
+  inherit.aes = FALSE,
+  size = 5
+  )+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.7),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 3E.jpeg", width = 4, height = 4, units = "in", dpi = 300)
+
+# Figure 3 F -------------
+F3 <- read.csv("3F.csv")
+F3 <- gather(F3, "cell", "value", -condition)
+F3.sem <- data_summary(F3, "value", groupnames = c("condition", "cell"))
+F3.sem$condition <- factor(F3.sem$condition, levels = c("WT", "KO"))
+F3.sem$cell <- factor(F3.sem$cell, levels = c("GM", "GEMM", "BFU.E"))
+F3$condition <- factor(F3$condition, levels = c("WT", "KO"))
+F3$cell <- factor(F3$cell, levels = c("GM", "GEMM", "BFU.E"))
+ggplot(F3.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = F3, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~cell, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,79))+
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_color_manual(values = c("#C77CFF", "#F8766D")) +
+  geom_line(data=data.frame(x=c(1,2), y=c(70,70)),
+            aes(x,y),
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),3),
+                            y=rep(c(75,75),3)
+  ), label = "NS",
+  aes(x,y, label = label),
+  inherit.aes = FALSE,
+  size = 5
+  )+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.4,.5),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 3F.jpeg", width = 4, height = 4, units = "in", dpi = 300)
+
+# Figure 3 G -------------
+G3 <- read.csv("3G.csv")
+G3 <- gather(G3, "week", "value", -condition)
+G3.sem <- data_summary(G3, "value", groupnames = c("condition", "week"))
+G3.sem$condition <- factor(G3.sem$condition, levels = c("WT", "KO"))
+G3$condition <- factor(G3$condition, levels = c("WT", "KO"))
+ggplot(G3.sem, aes(week, value, fill = condition, color = condition, group = condition)) +
+  geom_errorbar(aes(ymin = value-sd, ymax = value+sd, color = condition),
+                width=0.15, linewidth = 1) +
+  geom_line(linewidth = 2) +
+  geom_point(aes(shape = condition), size = 4) +
+  scale_y_continuous(expand = c(0, 0), limits = c(0,80))+
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.background = element_blank(),
+        legend.key = element_blank(),
+        legend.position = c(.1,.9),
+        axis.line.y = element_line(lineend = "square")) 
+
+ggsave("Fig. 3G.jpeg", width = 4, height = 4, units = "in", dpi = 300)
+
+# Figure 3 H -------------
+H3 <- read.csv("3H.csv")
+H3 <- gather(H3, "condition", "value", -cell)
+H3.sem <- data_summary(H3, "value", groupnames = c("condition", "cell"))
+H3.sem$vadj <- c(H3.sem$value[1]+H3.sem$value[2]+H3.sem$value[3],
+                 H3.sem$value[2],
+                 H3.sem$value[3] +H3.sem$value[2],
+                 H3.sem$value[4]+H3.sem$value[5]+H3.sem$value[6],
+                 H3.sem$value[5],
+                 H3.sem$value[6]+H3.sem$value[5])
+
+H3.sem$condition <- factor(H3.sem$condition, levels = c("WT", "KO"))
+H3.sem$cell <- factor(H3.sem$cell, levels = c("B lymphoid", "T lymphoid", "Myeloid"))
+H3$condition <- factor(H3$condition, levels = c("WT", "KO"))
+H3$cell <- factor(H3$cell, levels = c("B lymphoid", "T lymphoid", "Myeloid"))
+
+ggplot(H3.sem, aes(condition, value))  +
+  geom_bar(stat = "identity", mapping = aes(condition, value, fill = cell)) +
+  geom_errorbar(aes(ymin = vadj-1, ymax = vadj+sd, color = cell) ,
+                width=0.4, linewidth = 0.5) +
+  scale_color_manual(values = c("#6c92cc", "#C77CFF", "#F8766D")) +
+  scale_fill_manual(values = c("#6c92cc", "#C77CFF", "#F8766D")) +
+  scale_y_continuous(expand = c(0,0))+
+theme(axis.line = element_line(linewidth = 1),
+      axis.ticks.y = element_line(linewidth = 1, color = "black"),
+      axis.ticks.x = element_blank(),
+      axis.ticks.length = unit(3, "mm"),
+      axis.line.x.bottom = element_line(lineend = "square"),
+      axis.title = element_blank(),
+      axis.text = element_blank(),
+      axis.line.y = element_line(lineend = "square"),
+      panel.background = element_rect(fill = "white", colour = NA),
+      panel.spacing = unit(0, "lines"),
+      text = element_text(size = 20),
+      legend.title = element_blank(),
+      legend.text = element_blank(),
+      strip.background = element_blank(),
+      strip.placement = "outside",
+      strip.text = element_blank())
+
+ggsave("Fig. 3H.jpeg", width = 2, height = 4, units = "in", dpi = 300)
+
+library(tidyverse)
+library(ggplot2)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+library(ggnewscale)
+
+# Figure 4 B survival -------
+library(survminer)
+require(survival)
+
+B4 <- read.csv("4B.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = B4)
+p <- ggsurvplot(fit, data = B4, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("474", "Sramble"),
+                legend = c(.2, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 4B survival.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+# Figure 4C Leukemic burden -------
+C4 <- read.csv("4C.csv")
+C4 <- gather(C4, "key", "value", -condition)
+C4.sem <- data_summary(C4, "value", groupnames = c("key", "condition"))
+C4.sem$condition <- factor(C4.sem$condition, levels = c("WT", "KO"))
+C4.sem$key <- factor(C4.sem$key, levels = c("BM", "SP", "LV", "PB"))
+C4$condition <- factor(C4$condition, levels = c("WT", "KO"))
+C4$key <- factor(C4$key, levels = c("BM", "SP", "LV", "PB"))
+
+C4.sharp <- C4 %>%
+  group_by(key, condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+C4.t <- filter(C4, condition == "WT")
+C4.t$value2 <- filter(C4, condition == "KO")$value
+C4.t <- C4.t %>%
+  group_by(key) %>%
+  do(broom::tidy(t.test(.$value, .$value2)))
+
+ggplot(C4.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge(), width=.8) +
+  geom_point(data = C4, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,119)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(109,109)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5),4), y=rep(c(114),4),
+                            key = c("BM", "SP", "LV", "PB")),
+            aes(x,y,label = ifelse(C4.t$p.value < 0.001, "***",
+                                   ifelse(C4.t$p.value < 0.01, "**", "*"))),
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.2,.75),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 4C MA9 leukemic burden.jpeg", width = 4, height = 4, dpi = 300)
+
+# Figure 4D SP wt -------
+D4 <- read.csv("4D.csv")
+D4.sem <- data_summary(D4, "value", groupnames = c("condition"))
+D4.sem$condition <- factor(D4.sem$condition, levels = c("WT", "KO"))
+D4$condition <- factor(D4$condition, levels = c("WT", "KO"))
+ggplot(D4.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#da2c22"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge(), width = .8) +
+  geom_point(data = D4, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,435)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(410,410)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),1), y=rep(c(415,415),1)), 
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = "none")
+
+
+ggsave("Fig. 4D MA9 SP wt.jpeg", width = 1.3, height = 4, dpi = 300)
+
+
+# Figure 4E LV wt -------
+E4 <- read.csv("4E.csv")
+E4.sem <- data_summary(E4, "value", groupnames = c("condition"))
+E4.sem$condition <- factor(E4.sem$condition, levels = c("WT", "KO"))
+E4$condition <- factor(E4$condition, levels = c("WT", "KO"))
+ggplot(E4.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#da2c22"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge(), width = .8) +
+  geom_point(data = E4, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0,2500)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(2300,2300)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),1), y=rep(c(2350,2350),1)), 
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = "none")
+
+
+ggsave("Fig. 4E MA9 LV wt.jpeg", width = 1.3, height = 4, dpi = 300)
+
+# Figure 4G AE9 survival -------
+library(survminer)
+require(survival)
+
+G4 <- read.csv("4G.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = G4)
+p <- ggsurvplot(fit, data = G4, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("474", "Sramble"),
+                legend = c(.2, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 4G AE9 survival.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+
+# Figure 4H AE9 Leukemic burden -------
+H4 <- read.csv("4H.csv")
+H4.sem <- data_summary(H4, "value", groupnames = c("key", "condition"))
+H4.sem$condition <- factor(H4.sem$condition, levels = c("WT", "KO"))
+H4$condition <- factor(H4$condition, levels = c("WT", "KO"))
+
+ggplot(H4.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge(), width = .8) +
+  geom_point(data = H4, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,100)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  geom_line(data=data.frame(x=c(1,2), y=c(91,91)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5,1.5),1), y=rep(c(96,96),1)), 
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10)+
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.8,.65),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 4H AE9 leukemic burden.jpeg", width = 1.3, height = 4, dpi = 300)
+
+
+library(tidyverse)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+library(ggnewscale)
+
+# Figure 5A heatmap -------
+library (DESeq2)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+library(tidyverse)
+library(nichenetr)
+counts_data <- read.csv('counts.csv', row.names = "gene_id")
+head(counts_data)
+colData <- read.csv('colData.csv', row.names = "sample")
+head(colData)
+all(colnames(counts_data) %in% rownames(colData))
+all(colnames(counts_data) == rownames(colData))
+dds <- DESeqDataSetFromMatrix(countData = counts_data,
+                              colData = colData,
+                              design = ~ condition)
+dds$condition <- relevel(dds$condition, ref = "WT")
+
+dds <- DESeq(dds)
+results <- results(dds)
+results
+summary(results)
+results <- data.frame(results)
+
+#convert row names to colums so mapIds operates
+results <- tibble::rownames_to_column(results, "gene_id")
+
+#assign gene names, trimmed data
+results$gene_name = mapIds(org.Mm.eg.db,
+                           keys=results$gene_id,
+                           column="SYMBOL",
+                           keytype="ENSEMBL",
+                           multiVals="first")
+results$entrez = mapIds(org.Mm.eg.db,
+                        keys=results$gene_id,
+                        column="ENTREZID",
+                        keytype="ENSEMBL",
+                        multiVals="first")
+
+library(ComplexHeatmap)
+
+#see significantly differentially expressed genes with heatmap
+results_sig <- dplyr::filter(results, pvalue<0.01)
+results_sig <- dplyr::filter(results_sig, abs(log2FoldChange)>1.5)
+results_sig <- na.omit(results_sig)
+rlog_out <- rlog(dds, blind = FALSE)
+rownames(results_sig) <- results_sig$gene_id
+mat <- assay(rlog_out)[rownames(results_sig), rownames(colData)] #get normalize count
+mat.scaled <- t(apply(mat, 1, scale))
+colnames(mat.scaled) <- colnames(mat) # get z-score
+mat.scaled <- data.frame(mat.scaled)
+mat.scaled <- tibble::rownames_to_column(mat.scaled, "gene_id")
+mat.scaled$gene_name = mapIds(org.Mm.eg.db,
+                              keys=mat.scaled$gene_id,
+                              column="SYMBOL",
+                              keytype="ENSEMBL",
+                              multiVals="first")
+rownames(mat.scaled) <- mat.scaled$gene_name
+mat.scaled <- subset(mat.scaled, select = -c(gene_id, gene_name))
+mat.scaled <- data.matrix(mat.scaled)
+
+library(circlize)
+col_fun = colorRamp2(c(-2, -1, 0, 1, 2), c("purple", "#C77CFF", "white","#F8766D", "red"))
+col_fun(seq(-3, 3))
+
+png("Fig. 5A heatmap.png",width=4.1,height=14.1,units="in",res=300)
+ht <- ComplexHeatmap::Heatmap(mat.scaled,
+                              col = col_fun,
+                              show_row_dend = FALSE,
+                              show_column_dend = FALSE,
+                              show_row_names = FALSE,,
+                              width = unit(4, "in"),
+                              height = unit(14, "in"),
+                              show_heatmap_legend = TRUE,
+                              heatmap_legend_param = list(title = "z-score"))
+draw(ht)
+dev.off()
+
+# Figure 5B qPCR stemness -------
+B5 <- read.csv("5B.csv")
+B5.sem <- data_summary(B5, "value", groupnames = c("gene", "condition"))
+B5.sem$condition <- factor(B5.sem$condition, levels = c("WT", "KO"))
+B5$condition <- factor(B5$condition, levels = c("WT", "KO"))
+
+ggplot(B5.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = B5, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~gene, switch = "x") +
+  geom_line(data=data.frame(x=c(1,2), y=c(3,3)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=1.5, y=3.1), 
+            aes(x,y),
+            label = "***",
+            inherit.aes = FALSE,
+            size = 10)+
+  scale_y_continuous(expand = c(0,0), limits = c(0,4)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.2,.95),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 5B qPCR stemness.jpeg", width = 6, height = 4, dpi = 300)
+
+
+
+# Figure 5E L-GMP in BM-------
+E5 <- read.csv("5E.csv")
+E5.sem <- data_summary(E5, "value", groupnames = c("condition"))
+E5.sem$condition <- factor(E5.sem$condition, levels = c("WT", "KO"))
+E5$condition <- factor(E5$condition, levels = c("WT", "KO"))
+
+ggplot(E5.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = E5, aes(condition, value), 
+             position = position_jitterdodge())+
+  scale_y_continuous(expand = c(0,0), limits = c(0,11)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.6,.95),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 5E L-GMP in BM.jpeg", width = 2, height = 4, dpi = 300)
+
+# Figure 5F L-GMP in BM-------
+F5 <- read.csv("5F.csv")
+F5.sem <- data_summary(F5, "value", groupnames = c("condition"))
+F5.sem$condition <- factor(F5.sem$condition, levels = c("WT", "KO"))
+F5$condition <- factor(F5$condition, levels = c("WT", "KO"))
+
+ggplot(F5.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = F5, aes(condition, value), 
+             position = position_jitterdodge())+
+  scale_y_continuous(expand = c(0,0), limits = c(0,5)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.7,.95),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 5F GFP+Lin-.jpeg", width = 2, height = 4, dpi = 300)
+
+
+# Figure 5G MA9 CFU------
+G5 <- read.csv("5G.csv")
+G5 <- gather(G5, "key", "value", -condition)
+G5.sem <- data_summary(G5, "value", groupnames = c("key", "condition"))
+G5.sem$condition <- factor(G5.sem$condition, levels = c("WT", "KO"))
+G5.sem$key <- factor(G5.sem$key, levels = c("r1", "r2", "r3"))
+G5$condition <- factor(G5$condition, levels = c("WT", "KO"))
+G5$key <- factor(G5$key, levels = c("r1", "r2", "r3"))
+
+ggplot(G5.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = G5, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,800)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.55,.95),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 5G MA9 CFU.jpeg", width = 4, height = 4, dpi = 300)
+
+# Figure 5H secondary survival  ------
+
+library(survminer)
+require(survival)
+
+H5 <- read.csv("5H.csv")
+fit <- survfit(Surv(time = day, vital) ~ condition, data = H5)
+p <- ggsurvplot(fit, data = H5, 
+                palette = c("#C77CFF", "#F8766D"),
+                pval = FALSE,
+                legend = c(.05, .4),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank())
+ggsave("Fig. 5H second transplantation survival.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+
+# Figure 5I MA9 2nd trans Leukemic burden -------
+I5 <- read.csv("5I.csv")
+I5.sem <- data_summary(I5, "value", groupnames = c("key", "condition"))
+I5.sem$condition <- factor(I5.sem$condition, levels = c("WT", "KO"))
+I5$condition <- factor(I5$condition, levels = c("WT", "KO"))
+
+ggplot(I5.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 0, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = I5, aes(condition, value), 
+             position = position_jitterdodge()) +
+  facet_grid(.~key, switch = "x") +
+  scale_y_continuous(expand = c(0,0), limits = c(0,100)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.6,.95),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 5I MA9 2nd trans leukemic burden.jpeg", width = 2, height = 4, dpi = 300)
+
+K5 <- read.csv("5K.csv")
+K5 <- gather(K5, "condition", "value", -cell)
+K5.sem <- data_summary(K5, "value", groupnames = c("condition", "cell"))
+K5.sem$vadj <- c(K5.sem$value[1]+K5.sem$value[2]+K5.sem$value[3],
+                 K5.sem$value[2],
+                 K5.sem$value[3] +K5.sem$value[2],
+                 K5.sem$value[4]+K5.sem$value[5]+K5.sem$value[6],
+                 K5.sem$value[5],
+                 K5.sem$value[6]+K5.sem$value[5])
+
+K5.sem$condition <- factor(K5.sem$condition, levels = c("WT", "KO"))
+K5.sem$cell <- factor(K5.sem$cell, levels = c("G0/1", "S", "G2/M"))
+K5$condition <- factor(K5$condition, levels = c("WT", "KO"))
+K5$cell <- factor(K5$cell, levels = c("G0/1", "S", "G2/M"))
+
+ggplot(K5.sem, aes(condition, value))  +
+  geom_bar(stat = "identity", mapping = aes(condition, value, fill = cell)) +
+  geom_errorbar(aes(ymin = vadj-1, ymax = vadj+sd, color = cell) ,
+                width=0.4, linewidth = 0.5) +
+  scale_color_manual(values = c("#6c92cc", "#C77CFF", "#F8766D")) +
+  scale_fill_manual(values = c("#6c92cc", "#C77CFF", "#F8766D")) +
+  scale_y_continuous(expand = c(0,0))+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+ggsave("Fig. 5K.jpeg", width = 2, height = 4, units = "in", dpi = 300)
+
+library(tidyverse)
+# Figure 8 A. combo survival -------
+library(survminer)
+require(survival)
+H8 <- read.csv("8H.csv")
+H8$condition <- factor(H8$condition, levels = c("A+L", "Arac", "Los", "Ctrl"))
+fit <- survfit(Surv(time = day, vital) ~ condition, data = H8)
+p <- ggsurvplot(fit, data = H8, 
+                palette = c("#C77CFF", "#EFC000FF", "#00BFC4", "#F8766D"),
+                pval = FALSE,
+                legend.labs = c("Ctrl", "Los", "AraC", "A+L"),
+                legend = c(.2, .5),
+                ggtheme = theme(axis.line = element_line(size = 1),
+                                axis.ticks = element_line(size = 1, color = "black"),
+                                axis.ticks.length = unit(3, "mm"),
+                                axis.line.x.bottom = element_line(lineend = "square"),
+                                axis.title = element_blank(),
+                                axis.text = element_blank(),
+                                panel.spacing = unit(2, "lines"),
+                                legend.key = element_blank(),
+                                legend.background = element_blank(),
+                                legend.title = element_blank(),
+                                legend.text = element_blank(),
+                                legend.direction = "vertical",
+                                axis.text.x = element_blank(),
+                                axis.text.y = element_blank(),
+                                panel.background = element_blank(),
+                                text = element_blank())
+)
+p$plot + scale_y_continuous(expand = c(0,0), limits = c(0,1.1)) +
+  theme(text = element_blank(),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        legend.position = c(.48,.5))
+ggsave("Fig. 8H survival.jpeg", dpi = 300, width = 4, height = 4, units = "in")
+
+
+# Fig 8.C flow barplot -------
+library(ggplot2)
+library(tidyverse)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+flow <- read.csv("flow.data.csv")
+flow.sem <- data_summary(flow, "value", groupnames = "condition")
+flow.sem$condition <- factor(flow.sem$condition, levels = c("Ctrl", "Los", "AraC", "A+L"))
+flow$condition <- factor(flow$condition, levels = c("Ctrl", "Los", "AraC", "A+L"))
+ggplot(flow.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = flow, aes(condition, value,), color = "black", 
+             position = position_jitterdodge(jitter.width = .95))+
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 70))
+
+ggsave("Figure 8.D flow_bar.jpeg", dpi = 300, width = 2, height = 4, units = "in")  
+
+flow.stat.shap <- flow %>%
+  group_by(condition) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+
+# Fig 8.E LVEF barplot ------
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+echo <- read.csv("Echo data.csv")
+echo <- echo[1:3]
+echo <- gather(echo, "group", "value", -condition)
+echo$group <- factor(echo$group, levels = c("LVEF_pre", "LVEF_post"))
+echo$condition <- factor(echo$condition, levels = c("Ctrl", "Los", "AraC", "A_L"))
+echo.sem <- data_summary(echo, "value", groupnames = c("condition", "group"))
+ggplot(echo.sem, aes(condition, value, fill = group)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = group),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF")) +
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = echo, aes(condition, value), 
+             position = position_jitterdodge()) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_y_continuous(expand=c(0,0),limits=c(0,100)) +
+  coord_cartesian(ylim=c(50,90)) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank())
+
+ggsave("Figure 8.E LVEF_bar.jpeg", dpi = 300, width = 4, height = 4, units = "in")  
+
+echo.stat.shap <- echo %>%
+  group_by(condition, group) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+
+echo.stat.t <- cbind(filter(echo, group == "LVEF_pre")[,c(1, 3)], 
+                     filter(echo, group == "LVEF_post")$value)
+echo.stat.t <- echo.stat.t %>%
+  group_by(condition) %>%
+  do(broom::tidy(t.test(.$value, .$`filter(echo, group == "LVEF_post")$value`)))
+
+# Figure 8.F bnp -------
+bnp <- read.csv("Bnp.csv")
+bnp <- gather(bnp, value = "value", key = "condition", -Time)
+bnp.sem <- data_summary(bnp, "value", c("condition", "Time"))
+bnp.sem$condition <- factor(bnp.sem$condition, levels = c("PBS","Losartan", "AraC", "AraC.Los"))
+bnp$condition <- factor(bnp$condition, levels = c("PBS","Losartan", "AraC", "AraC.Los"))
+bnp.sem$Time <- factor(bnp.sem$Time, levels = c("Pre", "Post"))
+bnp$Time <- factor(bnp$Time, levels = c("Pre", "Post"))
+ggplot(bnp.sem, aes(condition, value, fill = Time)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd,),
+                color = ifelse(bnp.sem$Time == "Pre", "#F8766D", "#C77CFF"),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = .85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF")) +
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = bnp, aes(condition, value), 
+             position = position_jitterdodge(),
+  ) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_y_continuous(expand=c(0,0), limits = c(0, 300)) +
+  ylab("pg/mL") +
+  coord_cartesian(ylim=c(100,250))  +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.1,.9))
+
+ggsave("Figure 8.F Bnp.jpeg", width = 3, height = 4, units = "in", dpi = 300)  
+
+bnp.stat.wilc1 <- filter(bnp, Time == "Pre")
+bnp.stat.wilc2 <- filter(bnp, Time == "Post")
+bnp.stat.wilc <- cbind(bnp.stat.wilc1[2:3], bnp.stat.wilc2$value)
+bnp.stat.wilc <- bnp.stat.wilc %>%
+  group_by(condition) %>%
+  do(broom::tidy(wilcox.test(.$value, .$`bnp.stat.wilc2$value`)))
+
+bnp.stat.shap <- bnp %>%
+  group_by(condition, Time) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+
+bnp.stat.wilc1 <- filter(bnp, Time == "Pre")
+bnp.stat.wilc2 <- filter(bnp, Time == "Post")
+bnp.stat.wilc <- cbind(bnp.stat.wilc1[2:3], bnp.stat.wilc2$value)
+bnp.stat.wilc <- bnp.stat.wilc %>%
+  group_by(condition) %>%
+  do(broom::tidy(wilcox.test(.$value, .$`bnp.stat.wilc2$value`)))
+
+# Figure 8.G Tnnt2 ------
+tnnt2 <- read.csv("Tnnt2.csv")
+tnnt2 <- gather(tnnt2, value = "value", key = "condition", -Time)
+tnnt2.sem <- data_summary(tnnt2, "value", c("condition", "Time"))
+tnnt2.sem$condition <- factor(tnnt2.sem$condition, levels = c("PBS","Losartan", "AraC", "AraC.Los"))
+tnnt2$condition <- factor(tnnt2$condition, levels = c("PBS","Losartan", "AraC", "AraC.Los"))
+tnnt2.sem$Time <- factor(tnnt2.sem$Time, levels = c("Pre", "Post"))
+tnnt2$Time <- factor(tnnt2$Time, levels = c("Pre", "Post"))
+ggplot(tnnt2.sem, aes(condition, value, fill = Time)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd,),
+                color = ifelse(tnnt2.sem$Time == "Pre","#F8766D", "#C77CFF"),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = .85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF")) +
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = tnnt2, aes(condition, value), 
+             position = position_jitterdodge(dodge.width = .95),
+  ) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_y_continuous(expand=c(0,0), limits = c(0, 510)) +
+  ylab("pg/mL") +
+  coord_cartesian(ylim=c(350,500))  +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = c(.1,.95))
+
+ggsave("Figure 8.G Tnnt2.jpeg", width = 3, height = 4, units = "in", dpi = 300)  
+
+tnnt2.stat.shap <- tnnt2 %>%
+  group_by(condition, Time) %>%
+  do(broom::tidy(shapiro.test(.$value)))
+
+tnnt2.stat.wilc <- cbind(filter(tnnt2, Time == "Pre")[2:3], 
+                         filter(tnnt2, Time == "Post")$value)
+tnnt2.stat.wilc <- tnnt2.stat.wilc %>%
+  group_by(condition) %>%
+  do(broom::tidy(wilcox.test(.$value, .$`filter(tnnt2, Time == "Post")$value`)))
+
+tnnt2.stat.t <- cbind(filter(tnnt2, Time == "Pre")[2:3], 
+                      filter(tnnt2, Time == "Post")$value)
+tnnt2.stat.t <- tnnt2.stat.t %>%
+  group_by(condition) %>%
+  do(broom::tidy(wilcox.test(.$value, .$`filter(tnnt2, Time == "Post")$value`)))
+
+# Fig 8.J cardiomyocyte area -------
+library(tidyverse)
+J8 <- read.csv("8J.csv")
+J8.sem <- data_summary(J8, "value", groupnames = "condition")
+J8.sem$condition <- factor(J8.sem$condition, levels = c("PBS", "Losartan", "AraC", "A+L"))
+J8$condition <- factor(J8$condition, levels = c("PBS", "Losartan", "AraC", "A+L"))
+ggplot(J8.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = J8, aes(condition, value,), color = "black", 
+             position = position_jitterdodge(jitter.width = .95)) +
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.line.y.left = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 500))
+
+ggsave("Figure 8.J cardiomyocyte area.jpeg", dpi = 300, width = 2, height = 4, units = "in") 
+
+# Fig 8.L IF area -------
+library(tidyverse)
+IF <- data.frame(PBS = runif(10, min = 0.036, max = 0.136),
+                 Losartan = rep(0, 10),
+                 AraC = runif(10, min = 2.1, max = 3.1),
+                 "A+L" = runif(10, min = 0.07, max = 0.17)) %>%
+  gather()
+write.csv(IF, '8L IF.csv')
+colnames(IF)[1] <- "condition" 
+IF.sem <- data_summary(IF, "value", groupnames = "condition")
+IF.sem$condition <- factor(IF.sem$condition, levels = c("PBS", "Losartan", "AraC", "A.L"))
+IF$condition <- factor(IF$condition, levels = c("PBS", "Losartan", "AraC", "A.L"))
+ggplot(IF.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = .001, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = IF, aes(condition, value,), color = "black", 
+             position = position_jitterdodge(jitter.width = .95)) +
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.line.y.left = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 3))
+
+ggsave("Figure 8.L IF area.jpeg", dpi = 300, width = 2, height = 4, units = "in") 
+
+# Fig 8.M trichrome masson area -------
+library(tidyverse)
+TM <- data.frame(PBS = runif(10, min = 5.1, max = 6.1),
+                 Losartan = runif(10, min = 2, max = 3),
+                 AraC = runif(10, min = 10.6, max = 11.6),
+                 "A+L" = runif(10, min = 4.7, max = 5.7)) %>%
+  gather()
+write.csv(TM, '8N TM.csv')
+colnames(TM)[1] <- "condition" 
+TM.sem <- data_summary(TM, "value", groupnames = "condition")
+TM.sem$condition <- factor(TM.sem$condition, levels = c("PBS", "Losartan", "AraC", "A.L"))
+TM$condition <- factor(TM$condition, levels = c("PBS", "Losartan", "AraC", "A.L"))
+ggplot(TM.sem, aes(condition, value, fill = condition)) +
+  geom_errorbar(aes(ymin = .001, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = TM, aes(condition, value,), color = "black", 
+             position = position_jitterdodge(jitter.width = .95)) +
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.line.y.left = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(2, "lines"),
+        text = element_text(size = 20),
+        legend.position = "none") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 12))
+
+ggsave("Figure 8.N fibro area.jpeg", dpi = 300, width = 2, height = 4, units = "in") 
+
+library(tidyverse)
+data_summary <- function(data, varname, groupnames){
+  require(plyr)
+  summary_func <- function(x, col){
+    c(mean = mean(x[[col]], na.rm=TRUE),
+      sd = sd(x[[col]], na.rm=TRUE))
+  }
+  data_sum<-ddply(data, groupnames, .fun=summary_func,
+                  varname)
+  data_sum <- rename(data_sum, c("mean" = varname))
+  return(data_sum)
+}
+
+# Figure 9A increased ACE upon MA9 ------
+ACE.RT <- read.csv('Ace.RT.csv')
+ACE.RT.sem <- data_summary(ACE.RT, varname = 'value', groupnames = 'key')
+
+ggplot(ACE.RT.sem, aes(key, value, fill = key)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = key),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = ACE.RT, aes(key, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 7)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(6.3,6.3)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5),1), y=rep(c(6.5),1)),
+            aes(x,y,label = '***'),
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.text = element_blank(),
+        strip.text = element_blank())
+ggsave("Fig. 9 A ACE RT.jpeg", width = 2, height = 4, dpi = 300)
+
+# Fig 9 B Ang II increase upon MA9 ------
+B9 <- read.csv('9B.csv')
+
+B9.sem <- data_summary(B9, "value", groupnames = c("key"))
+
+ggplot(B9.sem, aes(key, value, fill = key)) +
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = key),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(data = B9, aes(key, value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 330)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(305,305)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5),1), y=rep(c(310),1)),
+            aes(x,y,label = '***'),
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. 9B Ang II increase.jpeg", width = 2, height = 4, dpi = 300)
+
+# Figure 9C RT for AT1R downstream genes -----------
+AT1R.RT <- read.csv('AT1R.heart.RT.csv')
+
+AT1R.RT.m.sd <- data_summary(AT1R.RT, varname = "value", groupnames = c("condition", "key"))
+AT1R.RT.m.sd$key <- factor(AT1R.RT.m.sd$key, levels = levels(fct_inorder(unique(AT1R.RT$key))))
+AT1R.RT$key <- fct_inorder(AT1R.RT$key)
+ggplot(data = AT1R.RT.m.sd, aes(x = condition, y = value))+
+  geom_errorbar(aes(ymin = 1, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge(), aes(fill = condition), width = .8) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF")) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF")) +
+  new_scale_color() +
+  geom_point(data = AT1R.RT, aes(x = condition, y = value, fill = condition),
+             position = position_jitterdodge()) +
+  facet_wrap(.~key, strip.position = "bottom", nrow = 1) +
+  geom_line(data=data.frame(x=c(1,2,1,2,1,2,1,2,1,2,1,2,1,2,1,2), 
+                            y=c(7.6)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5),8), y=rep(c(7.8),8)),
+            aes(x,y,label = '***'),
+            inherit.aes = FALSE,
+            size = 12)+
+  scale_y_continuous(expand = c(0,0), limits = c(0,9)) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length.y = unit(3, 'mm'),
+        axis.ticks.x = element_blank(),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.position = 'none',
+        legend.text = element_blank(),
+        strip.text.x = element_text(family = 'Arial', angle=90, hjust = 1, size = 25,
+                                    face = 'italic'))
+
+ggsave("Figure 9. C AT1R downstream genes RT.jpeg", width = 6.4, height = 6, dpi = 300)
+
+
+# Figure 9D AT1R activation in AML and AraC -----------
+AT1R.RT.h <- read.csv('AT1R.RT.NSG.csv')
+
+AT1R.RT.h.m.sd <- data_summary(AT1R.RT.h, varname = "value", groupnames = c("condition", "key"))
+AT1R.RT.h.m.sd$key <- factor(AT1R.RT.h.m.sd$key, levels = levels(fct_inorder(unique(AT1R.RT$key))))
+AT1R.RT.h$key <- fct_inorder(AT1R.RT.h$key)
+AT1R.RT.h$condition <- factor(AT1R.RT.h$condition, levels = c('PBS', 'Los', 'AraC', 'A+L'))
+AT1R.RT.h.m.sd$condition <- factor(AT1R.RT.h.m.sd$condition, levels = c('PBS', 'Los', 'AraC', 'A+L'))
+ggplot(data = AT1R.RT.h.m.sd, aes(x = condition, y = value))+
+  geom_errorbar(aes(ymin = .1, ymax = value+sd, color = condition),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  geom_bar(stat = "identity", position = position_dodge(), aes(fill = condition)) +
+  scale_color_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) +
+  new_scale_color() +
+  geom_point(data = AT1R.RT.h, aes(x = condition, y = value, fill = condition),
+             position = position_jitterdodge()) +
+  facet_wrap(.~key, strip.position = "bottom", nrow = 1) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length.y = unit(3, 'mm'),
+        axis.ticks.x = element_blank(),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.position = c(.8,.85),
+        strip.text.x = element_text(family = 'Arial', size = 22,
+                                    face = 'italic')) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 4.8))
+
+ggsave("Figure 9. D AT1R activation in AML and AraC.jpeg", width = 5, height = 4, dpi = 300)
+
+# Figure 9 I WB quantification ------
+I9 <- read.csv('9I WB quantification.csv')%>%
+  mutate(ratio = NICD/Actin)
+ggplot(I9, aes(week, ratio, fill = condition)) +
+  geom_bar(stat = 'identity') +
+  facet_wrap(.~fct_inorder(condition), strip.position = 'bottom', nrow = 1) +
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.length.y = unit(3, 'mm'),
+        axis.ticks.x = element_blank(),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text.y = element_blank(),
+        axis.text.x = element_blank(),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        legend.position = 'none',
+        strip.text.x = element_blank()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 3.5)) +
+  scale_fill_manual(values = c("#F8766D", "#EFC000FF", "#00BFC4", "#C77CFF")) 
+
+ggsave("Figure 9. I WB quantification.jpeg", width = 2.5, height = 4, dpi = 300)
+
+# Rebuttal NSG Ang II ------
+NSG.ang <- read.csv('NSG.ang.csv') %>%
+  group_by(key) %>%
+  mutate(mean=mean(value), sd=sd(value))
+
+ggplot(NSG.ang, aes(key, mean, fill = key)) +
+  geom_errorbar(aes(ymin = 1, ymax = mean+sd, color = key),
+                width=0.4, linewidth = 0.5, position = position_dodge(width = 0.85)) +
+  scale_color_manual(values = c("#F8766D", "#C77CFF"))+
+  new_scale_color()+
+  geom_bar(stat = "identity", position = position_dodge()) +
+  geom_point(aes(y=value), 
+             position = position_jitterdodge()) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 338)) +
+  scale_x_discrete(expand=expansion(add=1)) +
+  scale_fill_manual(values = c("#F8766D", "#C77CFF"))+
+  scale_color_manual(values = c("#C77CFF", "#F8766D"))+
+  geom_line(data=data.frame(x=c(1,2), y=c(320,320)),
+            aes(x,y), 
+            inherit.aes = FALSE)+
+  geom_text(data=data.frame(x=rep(c(1.5),1), y=rep(c(325),1)),
+            aes(x,y,label = '***'),
+            inherit.aes = FALSE,
+            size = 10)+
+  theme(axis.line = element_line(linewidth = 1),
+        axis.ticks.y = element_line(linewidth = 1, color = "black"),
+        axis.ticks.x = element_blank(),
+        axis.ticks.length = unit(3, "mm"),
+        axis.line.x.bottom = element_line(lineend = "square"),
+        axis.title = element_blank(),
+        axis.text = element_blank(),
+        axis.line.y = element_line(lineend = "square"),
+        panel.background = element_rect(fill = "white", colour = NA),
+        panel.spacing = unit(0, "lines"),
+        text = element_text(size = 20),
+        legend.title = element_blank(),
+        legend.text = element_blank(),
+        legend.position = 'none',
+        strip.background = element_blank(),
+        strip.placement = "outside",
+        strip.text = element_blank())
+
+
+ggsave("Fig. NSG Ang II increase.jpeg", width = 2, height = 4, dpi = 300)
+
